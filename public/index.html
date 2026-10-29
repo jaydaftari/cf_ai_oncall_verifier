@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Incident Copilot</title>
+    <meta name="description" content="AI incident-response copilot on Cloudflare Workers AI, Durable Objects and Workflows." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23f6821f'/><path d='M9 20l5-9 4 6 2-3 3 6' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <div class="brand-name">Incident Copilot</div>
+            <div class="brand-sub">Workers AI · Llama 3.3</div>
+          </div>
+        </div>
+        <button id="new-incident" class="btn btn-primary">+ New incident</button>
+        <div class="section-label">Incidents</div>
+        <ul id="incident-list" class="incident-list"></ul>
+      </aside>
+
+      <main class="chat">
+        <header class="chat-header">
+          <div>
+            <h1 id="incident-title">New incident</h1>
+            <div id="incident-id" class="mono muted"></div>
+          </div>
+          <button id="delete-incident" class="btn btn-ghost" title="Clear this incident's history">Clear</button>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite">
+          <div id="empty" class="empty">
+            <h2>What's on fire?</h2>
+            <p>Describe the symptoms, paste an alert or a log excerpt. The copilot helps you triage, and keeps the incident record and timeline up to date as you go.</p>
+            <div class="starters">
+              <button class="starter">PagerDuty: checkout-api p99 latency went from 180ms to 4.2s at 14:05 UTC, right after deploy v2.31 went out. Error rate is 6%.</button>
+              <button class="starter">Postgres primary is pinned at 100% CPU since 09:40, read replicas are 90s behind and the API is timing out on writes.</button>
+              <button class="starter">Kafka consumer lag on the orders topic has grown to 2M messages over the last hour. Consumers look healthy in k8s.</button>
+            </div>
+          </div>
+        </div>
+
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="Describe what you're seeing…" maxlength="8000" required></textarea>
+          <button id="send" class="btn btn-primary" type="submit">Send</button>
+        </form>
+      </main>
+
+      <aside class="record">
+        <section class="card">
+          <div class="section-label">Incident record</div>
+          <dl class="fields">
+            <dt>Severity</dt>
+            <dd>
+              <select id="severity">
+                <option value="unknown">Unknown</option>
+                <option value="SEV1">SEV1: major outage</option>
+                <option value="SEV2">SEV2: significant impact</option>
+                <option value="SEV3">SEV3: minor impact</option>
+                <option value="SEV4">SEV4: no customer impact</option>
+              </select>
+            </dd>
+            <dt>Status</dt>
+            <dd>
+              <select id="status">
+                <option value="investigating">Investigating</option>
+                <option value="identified">Identified</option>
+                <option value="mitigated">Mitigated</option>
+                <option value="resolved">Resolved</option>
+              </select>
+            </dd>
+            <dt>Service</dt>
+            <dd id="service" class="mono">—</dd>
+          </dl>
+          <p class="hint">Filled in automatically from the conversation. Changing a field by hand locks it.</p>
+        </section>
+
+        <section class="card">
+          <div class="section-label">Timeline</div>
+          <ol id="timeline" class="timeline"></ol>
+        </section>
+
+        <section class="card">
+          <div class="section-label">Postmortem</div>
+          <button id="generate" class="btn btn-secondary">Generate postmortem</button>
+          <div id="pm-progress" class="pm-progress" hidden></div>
+          <div id="pm-actions" class="pm-actions" hidden>
+            <button id="pm-copy" class="btn btn-ghost">Copy Markdown</button>
+            <button id="pm-download" class="btn btn-ghost">Download .md</button>
+          </div>
+          <article id="postmortem" class="markdown postmortem" hidden></article>
+        </section>
+      </aside>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
