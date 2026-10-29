@@ -1,59 +1,103 @@
-# cf_ai_incident_copilot
+# cf_ai_oncall_verifier
 
-An AI incident-response copilot that runs entirely on Cloudflare. You chat with it during a production incident. It helps you triage and keeps a structured incident record and timeline as you go. When the incident is over, it runs a durable multi-step Workflow that writes a blameless postmortem draft.
+**On-Call Verifier** is an AI on-call copilot, built entirely on Cloudflare, that won't let you close an incident until recovery is verified.
+
+Most incident tools treat "the graphs look better" as the end of the incident. In practice, many incidents regress after a hasty rollback, a cache that refills, or a retry storm that returns once traffic picks up. On-Call Verifier pairs with the on-call engineer through triage. Once the incident is mitigated, a long-running **Cloudflare Workflow** keeps checking back:
+
+- It asks whether error rate, latency and saturation are still at baseline.
+- At each check-in it drafts a stakeholder status update.
+- It closes the incident only when the engineer confirms recovery.
+- It reopens the incident if the engineer reports a regression.
+- If nobody answers, it refuses to mark the incident resolved.
+
+When the incident is over, a second Workflow drafts a blameless postmortem that records how recovery was verified.
 
 Built for the Cloudflare AI application assignment.
 
 | Requirement | Implementation |
 | --- | --- |
-| **LLM** | Llama 3.3 70B (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) on **Workers AI**: streaming chat, JSON-schema extraction, postmortem writing |
-| **Workflow / coordination** | **Cloudflare Workflows** (`PostmortemWorkflow`): a 5-step durable pipeline with per-step retries and checkpointing. A **Worker** routes requests at the edge |
+| **LLM** | Llama 3.3 70B (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) on **Workers AI**: streaming triage chat, JSON-schema record extraction, stakeholder updates, postmortem writing |
+| **Workflow / coordination** | Two **Cloudflare Workflows**. `RecoveryWatchWorkflow` uses durable `step.sleep` + `step.waitForEvent` check-ins that run for up to an hour or more. `PostmortemWorkflow` is a 5-step pipeline with retries and checkpointing. A **Worker** routes requests at the edge |
 | **User input (chat)** | Chat UI served as static assets by the Worker, with token streaming over Server-Sent Events |
-| **Memory / state** | One SQLite-backed **Durable Object** per incident (`IncidentRoom`) holds chat history, the incident record, the timeline and postmortem progress |
+| **Memory / state** | One SQLite-backed **Durable Object** per incident (`IncidentRoom`) holds chat history, the incident record, the timeline, stakeholder updates and the state of both Workflows. It also owns the incident's status state machine |
 
-## What it does
+## How it works
 
-1. **Triage chat.** Describe symptoms, paste an alert or a log line. The copilot answers as a senior SRE: mitigate first, then gather evidence, then find root cause. It suggests concrete diagnostics (`kubectl`, PromQL, `pg_stat_activity`, Kafka consumer-group commands) and ranks its hypotheses.
-2. **A live incident record.** Alongside every reply, a second Llama 3.3 call with a strict JSON schema pulls out the title, severity (SEV1–4), status, affected service and new timeline events. That output is validated and de-duplicated before it is written to the Durable Object. The updated record arrives as the last event of the same stream, so the side panel refreshes as soon as the reply finishes.
-3. **Human override.** If you set severity or status by hand, that field is locked and the model won't overwrite it.
-4. **Postmortem Workflow.** "Generate postmortem" starts a Workflow instance that runs these steps:
-   `load incident → reconstruct timeline → analyze impact & root cause → draft action items → save`
-   Each LLM step retries on its own (3 attempts, exponential backoff). Completed steps are checkpointed, so a model failure on step 3 does not re-run steps 1–2. The UI polls progress and renders the finished Markdown, which you can copy or download.
+### 1. Triage chat with a live incident record
+
+Describe symptoms, paste an alert or a log line. The copilot answers as a senior SRE: mitigate first, then gather evidence, then find root cause. It suggests concrete diagnostics (`kubectl`, PromQL, `pg_stat_activity`, Kafka consumer-group commands) and ranks its hypotheses.
+
+Alongside every reply, a second Llama 3.3 call with a strict JSON schema pulls out the title, severity (SEV1–4), status, affected service and new timeline events. That output is validated and de-duplicated before it touches state. The updated record arrives as the last event of the same stream. Setting severity or status by hand locks that field against the model.
+
+### 2. Recovery watch (the main feature)
+
+The status can become **Mitigated** in two ways: the model reads "we rolled back, errors are dropping" in the chat, or the engineer picks it from the dropdown. Either way, the Durable Object starts a `RecoveryWatchWorkflow`:
+
+```
+sleep(interval)                                   default 15 minutes, set by RECOVERY_CHECK_INTERVAL
+repeat up to 3 times:
+  draft a stakeholder update (Llama 3.3, retried; falls back to a template)
+  post a check-in to the chat: "still at baseline?"
+  waitForEvent("recovery-verdict", timeout = interval)
+    "recovered": status becomes resolved, recovery verified
+    "regressed": status becomes investigating, incident reopened
+no answer after the last check: watch expires and the incident stays mitigated
+```
+
+The engineer can answer with the panel buttons, or in plain words in the chat ("dashboards are flat, closing it out" / "errors are spiking again"). Every path changes status through one function in the Durable Object, and that function ends the watch with the right verdict.
+
+Why a Workflow: the watch can run for an hour or more and costs nothing between check-ins. Durable sleeps and event waits survive deploys and restarts, which a `setTimeout` or an alarm-juggling Worker can't guarantee.
+
+Edge cases handled (and exercised locally, see [Testing](#testing)):
+- **A verdict arrives while the Workflow is sleeping, not waiting.** The Workflow checks `watchOutcome()` before every check-in and exits instead of posting.
+- **Re-mitigation after a regression starts a new watch.** Every Workflow callback carries its instance ID, so the superseded watch can't write state.
+- **Clearing an incident** terminates its active watch.
+- **The stakeholder-update model call fails.** A fixed template is posted instead, so the watch keeps going.
+
+### 3. Postmortem Workflow
+
+`load incident → reconstruct timeline → analyze impact & root cause → draft action items → save`
+
+Each LLM step retries on its own (3 attempts, exponential backoff). Completed steps are checkpointed, so a failure on step 3 does not re-run steps 1–2. The draft includes a **Recovery verification** section from the watch's outcome (verified, regressed, or never verified). You can copy it or download it as Markdown.
 
 ## Architecture
 
 ```
 Browser (public/: index.html, app.js, styles.css)
-   │  POST /api/incidents/:id/chat  (SSE stream)
+   │  REST + SSE chat stream; polls while a Workflow is active
    ▼
 Worker (src/index.ts)  ── static assets served before the Worker runs
    │
-   ├──► IncidentRoom Durable Object (src/incident-room.ts)    one instance per incident
-   │       SQLite: messages · timeline · meta (record, locks, postmortem job)
-   │       ├─ Workers AI: streaming chat reply     ─┐ run in parallel
-   │       └─ Workers AI: JSON-schema extraction   ─┘ record update sent as final SSE event
+   ├──► IncidentRoom Durable Object (src/incident-room.ts)        one per incident
+   │       SQLite: messages · timeline · updates · meta
+   │       status state machine:  * → mitigated   starts the RecoveryWatch
+   │                              mitigated → *   ends it with a verdict (sendEvent)
+   │       ├─ Workers AI: streaming chat reply        ─┐ in parallel
+   │       └─ Workers AI: JSON-schema extraction      ─┘
+   │
+   ├──► RecoveryWatchWorkflow (src/recovery-watch-workflow.ts)
+   │       sleep → [stakeholder update (LLM) → check-in → waitForEvent] × 3 → expire
    │
    └──► PostmortemWorkflow (src/postmortem-workflow.ts)
-           step.do × 5, each LLM step with retries
-           reads the transcript from and writes the result to the same Durable Object over RPC
+           5 durable steps; reads from and writes to the Durable Object over RPC
 ```
 
-Why this shape:
+Design notes:
 
-- **A Durable Object per incident** gives one place to coordinate every request about that incident. Chat turns, extractor writes and Workflow writes are serialized, with no external database and no write races.
-- **A Workflow rather than one long request**: a postmortem is several model calls that can each fail. Workflows make it resumable and observable. The Durable Object holds the stage name so the UI can show progress.
-- **LLM output is untrusted input.** Extraction results go through `sanitizeExtraction` (enum allow-lists, length caps, a 5-event cap, de-duplication) before they touch state.
+- **A Durable Object per incident** gives one place to coordinate every request about that incident. Chat turns, extractor writes, check-ins and verdicts are serialized, with no external database and no races. The Workflows decide *when* things happen; the Durable Object decides *what the incident's state is*.
+- **LLM output is untrusted input.** Extraction results go through `sanitizeExtraction` (enum allow-lists, length caps, a 5-event cap, de-duplication) before they're written.
 
 ## API
 
 | Method & path | Description |
 | --- | --- |
 | `POST /api/incidents` | Create an incident ID |
-| `GET /api/incidents/:id` | Full snapshot: record, timeline, messages, postmortem job |
-| `PATCH /api/incidents/:id` | `{severity?, status?}`: manual override (locks the field) |
-| `DELETE /api/incidents/:id` | Clear the incident |
+| `GET /api/incidents/:id` | Full snapshot: record, timeline, messages, watch, stakeholder updates, postmortem job |
+| `PATCH /api/incidents/:id` | `{severity?, status?}`: manual override (locks the field; `status: "mitigated"` starts the watch) |
+| `POST /api/incidents/:id/verdict` | `{verdict: "recovered" \| "regressed"}`: answer a recovery check-in |
+| `DELETE /api/incidents/:id` | Clear the incident (and terminate its watch) |
 | `POST /api/incidents/:id/chat` | `{message}` → SSE events: `delta`, then `state`, then `done` (or `error`) |
-| `POST /api/incidents/:id/postmortem` | Start the postmortem Workflow (`409` if one is already running) |
+| `POST /api/incidents/:id/postmortem` | Start the postmortem Workflow (`409` if one is running) |
 | `GET /api/incidents/:id/postmortem` | Job stage, Workflow status and Markdown once complete |
 
 ## Running it
@@ -61,8 +105,8 @@ Why this shape:
 **Prerequisites:** Node.js 22+ (Wrangler 4 requires it) and a Cloudflare account (the free plan works; Workers AI calls use your account's quota).
 
 ```bash
-git clone https://github.com/jaydaftari/cf_ai_incident_copilot.git
-cd cf_ai_incident_copilot
+git clone https://github.com/jaydaftari/cf_ai_oncall_verifier.git
+cd cf_ai_oncall_verifier
 npm install
 npx wrangler login
 ```
@@ -73,7 +117,13 @@ npx wrangler login
 npm run dev
 ```
 
-Open http://localhost:8787. The Durable Object, the Workflow and the static assets run locally in `workerd`. The Workers AI binding always runs remotely, which is why `wrangler login` is required even for local dev.
+Open http://localhost:8787. The Durable Object, both Workflows and the static assets run locally in `workerd`. The Workers AI binding always runs remotely, which is why `wrangler login` is required even for local dev.
+
+To watch the recovery loop without waiting 15 minutes per check-in, shorten the interval:
+
+```bash
+npx wrangler dev --var RECOVERY_CHECK_INTERVAL:"30 seconds"
+```
 
 ### Deploy
 
@@ -81,41 +131,50 @@ Open http://localhost:8787. The Durable Object, the Workflow and the static asse
 npm run deploy
 ```
 
-Wrangler creates the Worker, the Durable Object namespace (SQLite migration `v1`) and the Workflow, then prints your `*.workers.dev` URL.
-
-### Tests and type-check
-
-```bash
-npm test           # vitest: SSE parsing, extraction sanitizing, transcript budget, postmortem assembly
-npm run typecheck  # tsc against types generated by `wrangler types`
-```
+Wrangler creates the Worker, the Durable Object namespace (SQLite migration `v1`) and both Workflows, then prints your `*.workers.dev` URL.
 
 ## Try it
 
-Click one of the starter prompts, or paste something like:
+1. Click a starter prompt, for example *"checkout-api p99 latency went from 180ms to 4.2s at 14:05 UTC, right after deploy v2.31…"*
+2. Follow the copilot's suggestions, then report the fix: *"rolled back v2.31 at 14:20, p99 is back to 200ms"*. The status flips to **Mitigated** and the recovery watch starts.
+3. At the check-in, click **Still healthy: resolve** (or type *"errors are spiking again"* to watch it reopen).
+4. Click **Generate postmortem**.
 
-> PagerDuty: checkout-api p99 latency went from 180ms to 4.2s at 14:05 UTC, right after deploy v2.31 went out. Error rate is 6%.
+## Testing
 
-Then follow up with what you find ("rolled back at 14:20, latency recovering", "root cause was a missing index in the new query") and watch the record and timeline fill in. Then click **Generate postmortem**.
+```bash
+npm test           # vitest: SSE parsing, extraction sanitizing, transcript budget, durations, postmortem assembly
+npm run typecheck  # tsc against types generated by `wrangler types`
+```
+
+The Durable Object and both Workflows were also exercised end to end under `wrangler dev`. A harness replaced Workers AI with a fake model and set a 5-second check interval. It covered these scenarios:
+- Mitigation detected from the chat, then confirmed at check-in #1: the incident resolves and no further check-ins are posted.
+- No answer: check-ins #1, #2 and #3 are posted, then the watch expires and the incident stays mitigated.
+- A regression reported during the first sleep: the watch exits without posting.
+- Re-mitigation after a regression: only the new watch posts.
+- The incident cleared mid-watch.
+- A forced model failure inside the postmortem Workflow: the step retries and the run resumes.
 
 ## Project layout
 
 ```
 src/
-  index.ts                Worker: API routing
-  incident-room.ts        Durable Object: state, streaming chat, extraction
-  postmortem-workflow.ts  Workflow: durable postmortem pipeline
-  prompts.ts              Every system/user prompt sent to the model
-  lib.ts                  Pure helpers (SSE parser, sanitizer, transcript, assembly)
+  index.ts                    Worker: API routing
+  incident-room.ts            Durable Object: state, status state machine, streaming chat, extraction
+  recovery-watch-workflow.ts  Workflow: post-mitigation check-ins and stakeholder updates
+  postmortem-workflow.ts      Workflow: durable postmortem pipeline
+  prompts.ts                  Every prompt sent to the model
+  lib.ts                      Pure helpers (SSE parser, sanitizer, transcript, durations, assembly)
   types.ts
-public/                   Chat UI (no build step)
-test/lib.test.ts          Unit tests
-wrangler.jsonc            Bindings: AI, Durable Object, Workflow, assets
-PROMPTS.md                AI prompts used to build this project
+public/                       Chat UI (no build step)
+test/lib.test.ts              Unit tests
+wrangler.jsonc                Bindings: AI, Durable Object, two Workflows, assets, check interval
+PROMPTS.md                    AI prompts used to build this project
 ```
 
 ## Limitations and next steps
 
 - No authentication: anyone with an incident ID can open it. In production, put Cloudflare Access in front, or add per-user auth and scope incidents to a team.
+- The engineer has to confirm recovery manually. The natural next step is for each check-in to query real signals (a Prometheus or Analytics Engine endpoint) and pre-fill the verdict, leaving the human to approve it.
+- Stakeholder updates are drafted but not sent. A Slack or status-page webhook would be one more Workflow step.
 - The sidebar's incident list is kept per browser in `localStorage`. A small index Durable Object or D1 table would let a team share it.
-- Possible next steps: voice input via Realtime, Slack/PagerDuty webhooks feeding the timeline, and Vectorize retrieval over past postmortems ("have we seen this before?").

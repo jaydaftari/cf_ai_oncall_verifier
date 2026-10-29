@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cf-ai-incident-copilot",
+  "name": "cf-ai-oncall-verifier",
   "main": "src/index.ts",
   "compatibility_date": "2025-10-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -17,14 +17,24 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["IncidentRoom"] }],
 
-  // Coordination: durable, retryable multi-step postmortem generation.
+  // Coordination:
+  //  - RECOVERY: long-running watch started on mitigation (durable sleeps + waitForEvent).
+  //  - POSTMORTEM: durable, retryable multi-step postmortem generation.
   "workflows": [
+    {
+      "name": "recovery-watch-workflow",
+      "binding": "RECOVERY",
+      "class_name": "RecoveryWatchWorkflow"
+    },
     {
       "name": "postmortem-workflow",
       "binding": "POSTMORTEM",
       "class_name": "PostmortemWorkflow"
     }
   ],
+
+  // Time between recovery check-ins (any Workflows duration, e.g. "10 minutes").
+  "vars": { "RECOVERY_CHECK_INTERVAL": "15 minutes" },
 
   "observability": { "enabled": true }
 }

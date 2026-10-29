@@ -4,6 +4,7 @@ import {
   buildTranscript,
   createSseParser,
   deltaFromEvent,
+  durationMs,
   resultText,
   sanitizeExtraction,
 } from "../src/lib";
@@ -107,5 +108,32 @@ describe("assemblePostmortem", () => {
     expect(doc.startsWith("# Postmortem: DB failover")).toBe(true);
     expect(doc.indexOf("## Summary")).toBeLessThan(doc.indexOf("## Timeline"));
     expect(doc.indexOf("## Timeline")).toBeLessThan(doc.indexOf("## Action items"));
+    expect(doc).not.toContain("## Recovery verification");
+  });
+
+  it("records the recovery watch outcome when there was one", () => {
+    const doc = assemblePostmortem({
+      meta: { title: "DB failover", severity: "SEV2", status: "resolved", service: "postgres" },
+      timeline: "-",
+      analysis: "## Summary",
+      actionItems: "-",
+      watch: { workflowId: "wf-1", state: "recovered", round: 2, maxChecks: 3, nextCheckAt: null },
+      generatedAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    expect(doc).toContain("## Recovery verification");
+    expect(doc).toContain("Recovery verified by the on-call engineer");
+    expect(doc).toContain("Check-ins completed: 2");
+  });
+});
+
+describe("durationMs", () => {
+  it("parses Workflows duration strings", () => {
+    expect(durationMs("15 minutes")).toBe(900_000);
+    expect(durationMs("1 hour")).toBe(3_600_000);
+    expect(durationMs("5 seconds")).toBe(5_000);
+  });
+
+  it("rejects anything else", () => {
+    expect(() => durationMs("soon")).toThrow();
   });
 });

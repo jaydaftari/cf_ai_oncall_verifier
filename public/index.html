@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Incident Copilot</title>
-    <meta name="description" content="AI incident-response copilot on Cloudflare Workers AI, Durable Objects and Workflows." />
+    <title>On-Call Verifier</title>
+    <meta name="description" content="AI on-call copilot that will not close an incident until recovery is verified. Built on Cloudflare Workers AI, Durable Objects and Workflows." />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23f6821f'/><path d='M9 20l5-9 4 6 2-3 3 6' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,7 +17,7 @@
         <div class="brand">
           <span class="brand-mark" aria-hidden="true"></span>
           <div>
-            <div class="brand-name">Incident Copilot</div>
+            <div class="brand-name">On-Call Verifier</div>
             <div class="brand-sub">Workers AI · Llama 3.3</div>
           </div>
         </div>
@@ -38,7 +38,7 @@
         <div id="messages" class="messages" aria-live="polite">
           <div id="empty" class="empty">
             <h2>What's on fire?</h2>
-            <p>Describe the symptoms, paste an alert or a log excerpt. The copilot helps you triage, and keeps the incident record and timeline up to date as you go.</p>
+            <p>Describe the symptoms, paste an alert or a log excerpt. The copilot helps you triage and keeps the incident record up to date. Once you've mitigated, it keeps checking back and won't close the incident until you confirm recovery.</p>
             <div class="starters">
               <button class="starter">PagerDuty: checkout-api p99 latency went from 180ms to 4.2s at 14:05 UTC, right after deploy v2.31 went out. Error rate is 6%.</button>
               <button class="starter">Postgres primary is pinned at 100% CPU since 09:40, read replicas are 90s behind and the API is timing out on writes.</button>
@@ -80,6 +80,20 @@
             <dd id="service" class="mono">—</dd>
           </dl>
           <p class="hint">Filled in automatically from the conversation. Changing a field by hand locks it.</p>
+        </section>
+
+        <section class="card watch-card" id="watch-card">
+          <div class="section-label">Recovery watch</div>
+          <div id="watch-body" class="watch-body"></div>
+          <div id="watch-verdict" class="watch-verdict" hidden>
+            <button class="btn btn-ok" data-verdict="recovered">Still healthy: resolve</button>
+            <button class="btn btn-bad" data-verdict="regressed">It regressed: reopen</button>
+          </div>
+        </section>
+
+        <section class="card" id="updates-card" hidden>
+          <div class="section-label">Stakeholder updates</div>
+          <ol id="updates" class="updates"></ol>
         </section>
 
         <section class="card">

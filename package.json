@@ -1,9 +1,9 @@
 {
-  "name": "cf-ai-incident-copilot",
+  "name": "cf-ai-oncall-verifier",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "AI incident-response copilot built on Cloudflare Workers AI, Durable Objects and Workflows.",
+  "description": "AI on-call copilot that will not close an incident until recovery is verified. Cloudflare Workers AI, Durable Objects and Workflows.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

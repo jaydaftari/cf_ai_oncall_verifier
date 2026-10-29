@@ -1,9 +1,10 @@
-// Incident Copilot front end: plain JS, no build step.
+// On-Call Verifier front end: plain JS, no build step.
 // Server state lives in the incident's Durable Object; localStorage only remembers
 // which incident IDs this browser has opened so the sidebar can list them.
 
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "incident-copilot:incidents";
+const STORAGE_KEY = "oncall-verifier:incidents";
+const WATCH_POLL_MS = 5000;
 
 const els = {
   list: $("incident-list"),
@@ -18,6 +19,11 @@ const els = {
   status: $("status"),
   service: $("service"),
   timeline: $("timeline"),
+  watchCard: $("watch-card"),
+  watchBody: $("watch-body"),
+  watchVerdict: $("watch-verdict"),
+  updatesCard: $("updates-card"),
+  updates: $("updates"),
   generate: $("generate"),
   pmProgress: $("pm-progress"),
   pmActions: $("pm-actions"),
@@ -26,7 +32,10 @@ const els = {
 
 let currentId = null;
 let streaming = false;
+let renderedMessages = 0;
+let watch = null;
 let pollTimer = null;
+const watchTimer = { tick: null, poll: null };
 let postmortemMarkdown = "";
 
 // ---------------------------------------------------------------- helpers
@@ -52,8 +61,8 @@ function saveIncidents(list) {
 }
 
 function rememberIncident(id, title) {
-  const list = loadIncidents().filter((i) => i.id !== id);
   const previous = loadIncidents().find((i) => i.id === id);
+  const list = loadIncidents().filter((i) => i.id !== id);
   list.unshift({ id, title: title || previous?.title || "Untitled incident" });
   saveIncidents(list);
   renderIncidentList();
@@ -67,6 +76,19 @@ async function api(path, options = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
   return data;
+}
+
+const isWatching = (w) => w && (w.state === "waiting" || w.state === "awaiting");
+
+function countdown(at) {
+  const s = Math.max(0, Math.round((at - Date.now()) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+async function copyText(button, text, label) {
+  await navigator.clipboard.writeText(text);
+  button.textContent = "Copied";
+  setTimeout(() => (button.textContent = label), 1500);
 }
 
 // --------------------------------------------------------------- rendering
@@ -101,11 +123,20 @@ function addMessage(role, content) {
   return div;
 }
 
-function renderRecord(state) {
-  const { meta, timeline, postmortem } = state;
+/** Messages can also arrive from the recovery watch, so re-sync from server state. */
+function syncMessages(messages) {
+  if (streaming || messages.length === renderedMessages) return;
+  els.messages.querySelectorAll(".msg").forEach((m) => m.remove());
+  els.empty.hidden = messages.length > 0;
+  messages.forEach((m) => addMessage(m.role, m.content));
+  renderedMessages = messages.length;
+}
+
+function renderState(state) {
+  const { meta, timeline } = state;
   const title = meta.title || "New incident";
   els.title.textContent = title;
-  document.title = `${title} · Incident Copilot`;
+  document.title = `${title} · On-Call Verifier`;
   els.severity.value = meta.severity;
   els.status.value = meta.status;
   els.service.textContent = meta.service || "—";
@@ -128,7 +159,69 @@ function renderRecord(state) {
   }
 
   if (meta.title) rememberIncident(currentId, meta.title);
-  renderPostmortem(postmortem);
+  syncMessages(state.messages);
+  renderWatch(state.watch);
+  renderUpdates(state.updates);
+  renderPostmortem(state.postmortem);
+}
+
+function renderWatch(next) {
+  watch = next;
+  const { state, round, maxChecks } = next;
+  const awaiting = state === "awaiting";
+  els.watchCard.classList.toggle("awaiting", awaiting);
+  els.watchVerdict.hidden = !awaiting;
+
+  const view = {
+    null: ["", "Idle", "Starts automatically when the incident is marked Mitigated."],
+    waiting: ["live", "Watching recovery", "First check-in in "],
+    awaiting: [
+      "live",
+      `Check-in ${round} of ${maxChecks}: still healthy?`,
+      round < maxChecks ? "Next check-in in " : "Watch expires in ",
+    ],
+    recovered: ["ok", "Recovery verified", `Confirmed after ${round} check-in${round === 1 ? "" : "s"}.`],
+    regressed: ["bad", "Regressed, incident reopened", "Mark it Mitigated again to restart the watch."],
+    expired: ["bad", "Expired without confirmation", "Still mitigated. Verify and resolve manually."],
+  }[state ?? "null"];
+
+  const [dot, label, detail] = view;
+  els.watchBody.innerHTML = `<div class="watch-status"><span class="dot ${dot}"></span><span></span></div><div class="watch-meta"></div>`;
+  els.watchBody.querySelector(".watch-status span:last-child").textContent = label;
+  const metaEl = els.watchBody.querySelector(".watch-meta");
+  const tick = () => {
+    metaEl.textContent = isWatching(watch) && watch.nextCheckAt ? detail + countdown(watch.nextCheckAt) : detail;
+  };
+  tick();
+
+  clearInterval(watchTimer.tick);
+  clearTimeout(watchTimer.poll);
+  if (isWatching(next)) {
+    watchTimer.tick = setInterval(tick, 1000);
+    watchTimer.poll = setTimeout(pollIncident, WATCH_POLL_MS);
+  }
+}
+
+function renderUpdates(updates) {
+  els.updatesCard.hidden = updates.length === 0;
+  els.updates.replaceChildren(
+    ...[...updates].reverse().map((u) => {
+      const li = document.createElement("li");
+      const head = document.createElement("div");
+      head.className = "update-head";
+      const when = document.createElement("span");
+      when.textContent = `#${u.round} · ${new Date(u.createdAt).toISOString().slice(11, 16)} UTC`;
+      const copy = document.createElement("button");
+      copy.textContent = "Copy";
+      copy.addEventListener("click", () => copyText(copy, u.content, "Copy"));
+      head.append(when, copy);
+      const body = document.createElement("div");
+      body.className = "markdown";
+      body.innerHTML = renderMarkdown(u.content);
+      li.append(head, body);
+      return li;
+    }),
+  );
 }
 
 function renderPostmortem(job) {
@@ -162,16 +255,26 @@ async function openIncident(id) {
   els.idLabel.textContent = `incident ${id.slice(0, 8)}`;
   els.messages.querySelectorAll(".msg").forEach((m) => m.remove());
   els.empty.hidden = false;
+  renderedMessages = 0;
   renderIncidentList();
 
   try {
     const state = await api(`/api/incidents/${id}`);
     if (id !== currentId) return;
-    state.messages.forEach((m) => addMessage(m.role, m.content));
-    renderRecord(state);
+    renderState(state);
     rememberIncident(id, state.meta.title);
   } catch (err) {
     addMessage("assistant", `Couldn't load incident: ${err.message}`).classList.add("msg-error");
+  }
+}
+
+async function pollIncident() {
+  const id = currentId;
+  try {
+    const state = await api(`/api/incidents/${id}`);
+    if (id === currentId) renderState(state);
+  } catch {
+    if (id === currentId) watchTimer.poll = setTimeout(pollIncident, WATCH_POLL_MS * 2);
   }
 }
 
@@ -189,6 +292,7 @@ async function sendMessage(text) {
   const bubble = addMessage("assistant", "");
   bubble.classList.add("typing");
   let reply = "";
+  let finalState = null;
 
   try {
     const res = await fetch(`/api/incidents/${currentId}/chat`, {
@@ -219,7 +323,7 @@ async function sendMessage(text) {
           bubble.innerHTML = renderMarkdown(reply);
           els.messages.scrollTop = els.messages.scrollHeight;
         } else if (event.type === "state") {
-          renderRecord(event.state);
+          finalState = event.state;
         } else if (event.type === "error") {
           throw new Error(event.error);
         }
@@ -233,6 +337,13 @@ async function sendMessage(text) {
     streaming = false;
     els.send.disabled = false;
     els.input.focus();
+  }
+
+  if (finalState) {
+    // Our two bubbles are now on the server; anything beyond them (e.g. the
+    // recovery watch reacting to this message) gets synced in.
+    renderedMessages += 2;
+    renderState(finalState);
   }
 }
 
@@ -291,9 +402,24 @@ for (const field of ["severity", "status"]) {
       method: "PATCH",
       body: JSON.stringify({ [field]: els[field].value }),
     });
-    renderRecord(state);
+    renderState(state);
   });
 }
+
+els.watchVerdict.querySelectorAll("button").forEach((btn) =>
+  btn.addEventListener("click", async () => {
+    els.watchVerdict.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    try {
+      const state = await api(`/api/incidents/${currentId}/verdict`, {
+        method: "POST",
+        body: JSON.stringify({ verdict: btn.dataset.verdict }),
+      });
+      renderState(state);
+    } finally {
+      els.watchVerdict.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    }
+  }),
+);
 
 els.generate.addEventListener("click", async () => {
   els.generate.disabled = true;
@@ -308,11 +434,7 @@ els.generate.addEventListener("click", async () => {
   }
 });
 
-$("pm-copy").addEventListener("click", async () => {
-  await navigator.clipboard.writeText(postmortemMarkdown);
-  $("pm-copy").textContent = "Copied";
-  setTimeout(() => ($("pm-copy").textContent = "Copy Markdown"), 1500);
-});
+$("pm-copy").addEventListener("click", () => copyText($("pm-copy"), postmortemMarkdown, "Copy Markdown"));
 
 $("pm-download").addEventListener("click", () => {
   const blob = new Blob([postmortemMarkdown], { type: "text/markdown" });

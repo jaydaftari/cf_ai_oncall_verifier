@@ -1,5 +1,6 @@
 export { IncidentRoom } from "./incident-room";
 export { PostmortemWorkflow } from "./postmortem-workflow";
+export { RecoveryWatchWorkflow } from "./recovery-watch-workflow";
 
 const INCIDENT_ROUTE = /^\/api\/incidents\/([A-Za-z0-9-]{8,64})(\/[a-z]+)?$/;
 
@@ -35,7 +36,15 @@ export default {
 
       case "PATCH ": {
         const patch = (await request.json().catch(() => ({}))) as { severity?: string; status?: string };
-        return json({ id, ...(await room.updateMeta(patch)) });
+        return json({ id, ...(await room.updateMeta(id, patch)) });
+      }
+
+      case "POST /verdict": {
+        const { verdict } = (await request.json().catch(() => ({}))) as { verdict?: string };
+        if (verdict !== "recovered" && verdict !== "regressed") {
+          return json({ error: 'verdict must be "recovered" or "regressed"' }, 400);
+        }
+        return json({ id, ...(await room.recordVerdict(id, verdict)) });
       }
 
       case "POST /chat":

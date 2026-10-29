@@ -18,7 +18,7 @@ export function describeIncident(meta: IncidentMeta, timeline: TimelineEvent[]):
 }
 
 export function chatSystemPrompt(meta: IncidentMeta, timeline: TimelineEvent[]): string {
-  return `You are Incident Copilot, a senior Site Reliability Engineer pairing with an on-call engineer during a live production incident.
+  return `You are On-Call Verifier, a senior Site Reliability Engineer pairing with an on-call engineer during a live production incident.
 
 How you work:
 - Priorities, in order: stop the bleeding (mitigate), then gather evidence, then find root cause.
@@ -28,6 +28,7 @@ How you work:
 - Never invent facts about their system. Label guesses as hypotheses and rank them by likelihood.
 - If the impact sounds customer-facing and severity is unknown, recommend a severity and who to page.
 - Use blameless language.
+- Mitigated is not resolved. Once impact stops, a recovery watch checks back periodically, and the incident only closes when the engineer confirms metrics have stayed at baseline. Tell them which signals to watch (error rate, latency, saturation, queue lag) to confirm recovery.
 
 Current incident record (kept up to date automatically from the conversation):
 ${describeIncident(meta, timeline)}`;
@@ -67,6 +68,31 @@ export function extractorUserPrompt(
   message: string,
 ): string {
   return `Current record:\n${describeIncident(meta, timeline)}\n\nEngineer's latest message:\n"""\n${message}\n"""`;
+}
+
+// Recovery watch prompt: drafted at every check-in while the incident is mitigated.
+
+export const STATUS_UPDATE_SYSTEM_PROMPT = `You write incident status updates for stakeholders outside the on-call team (support, account managers, leadership). Plain language, no jargon, no blame, no speculation. Use only facts from the material you are given.`;
+
+export function statusUpdatePrompt(
+  incident: string,
+  transcript: string,
+  minutesSinceMitigation: number,
+  nextUpdate: string,
+): string {
+  return `Write the next stakeholder status update. The incident was mitigated about ${minutesSinceMitigation} minutes ago and the team is verifying recovery.
+
+Format exactly (Markdown, max 90 words total):
+**Status:** <one line>
+**Impact:** <one line: who is or was affected>
+**What we did:** <one line>
+**Next update:** in ${nextUpdate}, or sooner if anything changes.
+
+Incident record:
+${incident}
+
+Recent conversation:
+${transcript}`;
 }
 
 // Postmortem workflow prompts: one focused prompt per durable step.

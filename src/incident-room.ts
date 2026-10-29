@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { createSseParser, deltaFromEvent, resultContent, sanitizeExtraction } from "./lib";
+import { createSseParser, deltaFromEvent, durationMs, resultContent, sanitizeExtraction } from "./lib";
 import {
   EXTRACTION_SCHEMA,
   EXTRACTOR_SYSTEM_PROMPT,
@@ -7,26 +7,37 @@ import {
   chatSystemPrompt,
   extractorUserPrompt,
 } from "./prompts";
-import { SEVERITIES, STATUSES } from "./types";
+import { MAX_RECOVERY_CHECKS, SEVERITIES, STATUSES } from "./types";
 import type {
   ChatMessage,
   IncidentMeta,
   IncidentSnapshot,
   PostmortemJob,
+  RecoveryWatch,
   Severity,
+  StakeholderUpdate,
   Status,
   TimelineEvent,
+  Verdict,
+  WatchState,
 } from "./types";
 
 const CHAT_HISTORY_TURNS = 20;
 const MAX_MESSAGE_CHARS = 8_000;
+export const VERDICT_EVENT = "recovery-verdict";
+
+const utcNow = () => `${new Date().toISOString().slice(11, 16)} UTC`;
 
 /**
  * One Durable Object per incident. It is the single source of truth for that
  * incident: chat history, the structured record (title, severity, status,
- * service), the timeline, and postmortem progress, all in its SQLite storage.
- * Because every request for an incident is routed to the same instance, writes
- * are serialized and the record never races with itself.
+ * service), the timeline, stakeholder updates, and Workflow progress, all in
+ * its SQLite storage. Every request for an incident is routed to the same
+ * instance, so writes are serialized and the record never races with itself.
+ *
+ * It also owns the incident's status state machine: moving to "mitigated"
+ * starts a RecoveryWatchWorkflow, and leaving "mitigated" (whether by a button,
+ * a dropdown, or the extractor reading the chat) ends it with a verdict.
  */
 export class IncidentRoom extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -46,6 +57,12 @@ export class IncidentRoom extends DurableObject<Env> {
         time TEXT NOT NULL,
         event TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS updates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -60,13 +77,25 @@ export class IncidentRoom extends DurableObject<Env> {
   }
 
   /** Manual edits from the UI. A manually set field is locked against the extractor. */
-  async updateMeta(patch: { severity?: string; status?: string }): Promise<IncidentSnapshot> {
+  async updateMeta(
+    incidentId: string,
+    patch: { severity?: string; status?: string },
+  ): Promise<IncidentSnapshot> {
+    this.remember(incidentId);
     if (SEVERITIES.includes(patch.severity as Severity)) {
       this.setMeta({ severity: patch.severity!, severity_locked: "1" });
     }
     if (STATUSES.includes(patch.status as Status)) {
-      this.setMeta({ status: patch.status!, status_locked: "1" });
+      this.setMeta({ status_locked: "1" });
+      await this.transition(patch.status as Status);
     }
+    return this.snapshot();
+  }
+
+  /** The engineer's answer to a recovery check-in. */
+  async recordVerdict(incidentId: string, verdict: Verdict): Promise<IncidentSnapshot> {
+    this.remember(incidentId);
+    await this.transition(verdict === "recovered" ? "resolved" : "investigating");
     return this.snapshot();
   }
 
@@ -86,8 +115,56 @@ export class IncidentRoom extends DurableObject<Env> {
     this.setMeta({ pm_stage: "Failed", pm_error: error });
   }
 
+  // Recovery watch callbacks. Each takes the caller's workflow ID so that a
+  // superseded watch (incident re-mitigated, or cleared) can't write state.
+
+  /** null while the watch is still live, otherwise why it should stop. */
+  async watchOutcome(workflowId: string): Promise<WatchState | "superseded" | null> {
+    const watch = this.watch();
+    if (watch.workflowId !== workflowId) return "superseded";
+    return watch.state === "waiting" || watch.state === "awaiting" ? null : watch.state;
+  }
+
+  async postCheckIn(workflowId: string, round: number, update: string, minutes: number): Promise<void> {
+    if ((await this.watchOutcome(workflowId)) !== null) return;
+    this.sql.exec(
+      "INSERT INTO updates (round, content, created_at) VALUES (?, ?, ?)",
+      round,
+      update,
+      Date.now(),
+    );
+    this.insertMessage(
+      "assistant",
+      `**Recovery check #${round}**: ${minutes} minutes since mitigation.\n\n` +
+        "Are error rates, latency and saturation still at baseline? Answer with the buttons in the panel, " +
+        "or just tell me what the dashboards show.\n\nI drafted a stakeholder update in the panel.",
+    );
+    this.setMeta({
+      watch_state: "awaiting",
+      watch_round: String(round),
+      watch_next_at: String(Date.now() + durationMs(this.env.RECOVERY_CHECK_INTERVAL)),
+    });
+  }
+
+  async watchExpired(workflowId: string): Promise<void> {
+    if ((await this.watchOutcome(workflowId)) !== null) return;
+    this.setMeta({ watch_state: "expired", watch_next_at: null });
+    this.addTimelineEvent(utcNow(), "Recovery watch expired without confirmation");
+    this.insertMessage(
+      "assistant",
+      "**Recovery watch expired.** Nobody confirmed recovery after the final check-in, so I'm leaving the incident " +
+        "as *mitigated* rather than closing it. Verify the dashboards and resolve it manually when you're sure.",
+    );
+  }
+
   async reset(): Promise<void> {
-    this.sql.exec("DELETE FROM messages; DELETE FROM timeline; DELETE FROM meta;");
+    const watch = this.watch();
+    if (watch.workflowId && (watch.state === "waiting" || watch.state === "awaiting")) {
+      await this.env.RECOVERY.get(watch.workflowId)
+        .then((instance) => instance.terminate())
+        .catch(() => {});
+    }
+    this.sql.exec("DELETE FROM messages; DELETE FROM timeline; DELETE FROM updates; DELETE FROM meta;");
   }
 
   // ------------------------------------------------------- streaming chat
@@ -95,6 +172,9 @@ export class IncidentRoom extends DurableObject<Env> {
   /** POST {message} -> SSE stream of {type:"delta"|"state"|"done"|"error"} events. */
   async fetch(request: Request): Promise<Response> {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+
+    const incidentId = new URL(request.url).pathname.split("/")[3];
+    if (incidentId) this.remember(incidentId);
 
     const body = (await request.json().catch(() => null)) as { message?: unknown } | null;
     const message = typeof body?.message === "string" ? body.message.trim() : "";
@@ -186,9 +266,56 @@ export class IncidentRoom extends DurableObject<Env> {
     if (update.title && !meta.title) this.setMeta({ title: update.title });
     if (update.service) this.setMeta({ service: update.service });
     if (update.severity && !locked.severity_locked) this.setMeta({ severity: update.severity });
-    if (update.status && !locked.status_locked) this.setMeta({ status: update.status });
-    for (const e of update.events) {
-      this.sql.exec("INSERT INTO timeline (time, event) VALUES (?, ?)", e.time, e.event);
+    for (const e of update.events) this.addTimelineEvent(e.time, e.event);
+    if (update.status && !locked.status_locked) await this.transition(update.status);
+  }
+
+  /** The only place status changes, so the recovery watch can't drift out of sync. */
+  private async transition(next: Status) {
+    if (next === this.meta().status) return;
+    this.setMeta({ status: next });
+
+    const { state } = this.watch();
+    const watching = state === "waiting" || state === "awaiting";
+    if (next === "mitigated" && !watching) await this.startWatch();
+    else if (next !== "mitigated" && watching) await this.endWatch(next === "resolved" ? "recovered" : "regressed");
+  }
+
+  private async startWatch() {
+    const incidentId = this.rawMeta().incident_id;
+    if (!incidentId) return console.error("cannot start recovery watch: incident id unknown");
+
+    const interval = this.env.RECOVERY_CHECK_INTERVAL;
+    const instance = await this.env.RECOVERY.create({ params: { incidentId } });
+    this.setMeta({
+      watch_workflow: instance.id,
+      watch_state: "waiting",
+      watch_round: "0",
+      watch_started_at: String(Date.now()),
+      watch_next_at: String(Date.now() + durationMs(interval)),
+    });
+    this.addTimelineEvent(utcNow(), `Impact mitigated; recovery watch started (first check in ${interval})`);
+  }
+
+  private async endWatch(verdict: Verdict) {
+    const { workflowId } = this.watch();
+    this.setMeta({ watch_state: verdict, watch_next_at: null });
+    if (verdict === "recovered") {
+      this.addTimelineEvent(utcNow(), "Recovery verified by on-call engineer; incident resolved");
+      this.insertMessage("assistant", "**Recovery verified.** Marking the incident resolved. Generate the postmortem while it's fresh.");
+    } else {
+      this.addTimelineEvent(utcNow(), "Regression reported during recovery watch; incident reopened");
+      this.insertMessage(
+        "assistant",
+        "**Regression reported, so the incident is reopened.** What changed? Paste the alert or the metric that moved and we'll pick the investigation back up.",
+      );
+    }
+    // Wake the Workflow if it's blocked in waitForEvent. If it's sleeping, it
+    // sees the verdict via watchOutcome() when it wakes.
+    if (workflowId) {
+      await this.env.RECOVERY.get(workflowId)
+        .then((instance) => instance.sendEvent({ type: VERDICT_EVENT, payload: { verdict } }))
+        .catch((err) => console.warn("could not signal recovery watch", err));
     }
   }
 
@@ -198,7 +325,13 @@ export class IncidentRoom extends DurableObject<Env> {
       timeline: this.timeline(),
       messages: this.messages(200),
       postmortem: this.postmortem(),
+      watch: this.watch(),
+      updates: this.updates(),
     };
+  }
+
+  private remember(incidentId: string) {
+    if (!this.rawMeta().incident_id) this.setMeta({ incident_id: incidentId });
   }
 
   private rawMeta(): Record<string, string> {
@@ -226,6 +359,17 @@ export class IncidentRoom extends DurableObject<Env> {
     };
   }
 
+  private watch(): RecoveryWatch {
+    const m = this.rawMeta();
+    return {
+      workflowId: m.watch_workflow ?? null,
+      state: (m.watch_state as WatchState) ?? null,
+      round: Number(m.watch_round ?? 0),
+      maxChecks: MAX_RECOVERY_CHECKS,
+      nextCheckAt: m.watch_next_at ? Number(m.watch_next_at) : null,
+    };
+  }
+
   private setMeta(values: Record<string, string | null>) {
     for (const [key, value] of Object.entries(values)) {
       if (value === null) {
@@ -244,6 +388,19 @@ export class IncidentRoom extends DurableObject<Env> {
     return this.sql
       .exec<{ id: number; time: string; event: string }>("SELECT id, time, event FROM timeline ORDER BY id")
       .toArray();
+  }
+
+  private addTimelineEvent(time: string, event: string) {
+    this.sql.exec("INSERT INTO timeline (time, event) VALUES (?, ?)", time, event);
+  }
+
+  private updates(): StakeholderUpdate[] {
+    return this.sql
+      .exec<{ round: number; content: string; created_at: number }>(
+        "SELECT round, content, created_at FROM updates ORDER BY id",
+      )
+      .toArray()
+      .map((r) => ({ round: r.round, content: r.content, createdAt: r.created_at }));
   }
 
   private messages(limit: number): ChatMessage[] {

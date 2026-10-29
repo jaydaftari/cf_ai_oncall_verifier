@@ -211,6 +211,25 @@ select {
 .pm-progress.failed { color: var(--danger); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.watch-body { font-size: 13.5px; }
+.watch-body .watch-status { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.watch-body .watch-meta { font: 12.5px var(--mono); color: var(--muted); margin-top: 4px; }
+.watch-body .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.watch-body .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+.watch-body .dot.ok { background: var(--ok); }
+.watch-body .dot.bad { background: var(--danger); }
+@keyframes pulse { 50% { opacity: 0.35; } }
+.watch-card.awaiting { border-color: var(--accent); }
+.watch-verdict { display: grid; gap: 8px; margin-top: 12px; }
+.btn-ok { background: var(--ok); color: #fff; }
+.btn-bad { background: transparent; color: var(--danger); border-color: var(--danger); }
+
+.updates { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.updates li { font-size: 13px; border-left: 3px solid var(--accent); padding: 2px 0 2px 10px; }
+.updates .update-head { display: flex; justify-content: space-between; align-items: center; font: 12px var(--mono); color: var(--muted); margin-bottom: 4px; }
+.updates .update-head button { font: 12px var(--mono); color: var(--muted); background: none; border: 0; cursor: pointer; padding: 0; }
+.updates .update-head button:hover { color: var(--text); }
+
 .pm-actions { display: flex; gap: 8px; margin-top: 12px; }
 .postmortem { margin-top: 12px; font-size: 13.5px; border-top: 1px solid var(--border); padding-top: 8px; }
 

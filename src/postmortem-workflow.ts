@@ -39,6 +39,7 @@ export class PostmortemWorkflow extends WorkflowEntrypoint<Env, PostmortemParams
         if (snap.messages.length === 0) throw new NonRetryableError("Incident has no conversation yet");
         return {
           meta: snap.meta,
+          watch: snap.watch,
           incident: describeIncident(snap.meta, snap.timeline),
           transcript: buildTranscript(snap.messages),
         };
@@ -65,6 +66,7 @@ export class PostmortemWorkflow extends WorkflowEntrypoint<Env, PostmortemParams
           timeline,
           analysis,
           actionItems,
+          watch: loaded.watch,
           generatedAt: new Date(),
         });
         await room.savePostmortem(doc);

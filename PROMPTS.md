@@ -43,6 +43,26 @@ The project was built in one Claude Code session. These are my prompts, verbatim
   - `wrangler dev` with a test harness that replaced Workers AI with a fake model, to exercise the real Durable Object and Workflow locally: SSE streaming, record extraction, manual-override locking, the full postmortem Workflow, and a forced model failure to confirm the step retries and resumes.
 - Fixed one issue found in that testing: an empty incident made the Workflow retry a deterministic error. It now returns `400` up front and uses `NonRetryableError`.
 
+**Prompt 5**
+
+> also check if anything public exist for this
+
+**Prompt 6** (after the assistant reported its findings and proposed a differentiating feature)
+
+> ok do it
+
+### What the assistant did with prompts 5–6
+
+- Searched GitHub. Incident copilots turned out to be a common theme among public submissions for this assignment: 22 repos are named `cf_ai_incident…`. Several pair a Durable Object with a postmortem Workflow.
+- To make the project distinct, it designed and built the **recovery watch**: a long-running `RecoveryWatchWorkflow` started on mitigation. It runs durable sleeps and `waitForEvent` check-ins, drafts a stakeholder update at each check-in, and closes the incident only when the engineer confirms recovery. A regression reopens the incident, and if nobody answers it never auto-resolves. The status state machine moved into the Durable Object so that buttons, dropdowns and the chat extractor all go through one path.
+- Renamed the project to `cf_ai_oncall_verifier` / On-Call Verifier.
+- Verified with 13 unit tests, plus a `wrangler dev` harness (fake model, 5-second interval). The harness ran five scenarios:
+  - Confirmed recovery.
+  - No answer until the watch expires after check-in #3.
+  - A regression during the sleep, where the watch exits without posting.
+  - Re-mitigation, where only the new watch posts.
+  - Clearing the incident mid-watch.
+
 ## 2. Runtime prompts (sent to Llama 3.3 by the app)
 
 All prompts are in [`src/prompts.ts`](src/prompts.ts). In summary:
@@ -51,7 +71,8 @@ All prompts are in [`src/prompts.ts`](src/prompts.ts). In summary:
 | --- | --- | --- |
 | `chatSystemPrompt(meta, timeline)` | `IncidentRoom.fetch` (streaming) | Senior-SRE persona. Mitigate → evidence → root cause, concrete diagnostics, at most one question per reply, label hypotheses, blameless language. Includes the live incident record and timeline. |
 | `EXTRACTOR_SYSTEM_PROMPT` + `extractorUserPrompt` | `IncidentRoom.extractAndApply` | Returns only the record changes the latest message supports (title, SEV1–4, status, service, new timeline events). Constrained with `response_format: json_schema` (`EXTRACTION_SCHEMA`). |
-| `POSTMORTEM_SYSTEM_PROMPT` | Every Workflow LLM step | Blameless, Google-SRE-style postmortem writer. Facts only; says "Unknown" instead of guessing. |
+| `STATUS_UPDATE_SYSTEM_PROMPT` + `statusUpdatePrompt` | `RecoveryWatchWorkflow` step "draft stakeholder update N" | A plain-language update for non-engineers (Status / Impact / What we did / Next update), at most 90 words, facts only. |
+| `POSTMORTEM_SYSTEM_PROMPT` | Every postmortem Workflow LLM step | Blameless, Google-SRE-style postmortem writer. Facts only; says "Unknown" instead of guessing. |
 | `timelinePrompt` | Workflow step "reconstruct timeline" | Chronological bullet timeline, at most 20 entries. |
 | `analysisPrompt` | Workflow step "analyze impact and root cause" | Summary, Impact, Root cause (marked unconfirmed if needed), Contributing factors, What went well. |
 | `actionItemsPrompt` | Workflow step "draft action items" | 4–8 specific, verifiable actions as a table (Prevent / Detect / Mitigate / Process, P0–P2). |

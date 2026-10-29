@@ -30,11 +30,40 @@ export interface PostmortemJob {
   error: string | null;
 }
 
+export type Verdict = "recovered" | "regressed";
+
+/**
+ * Recovery watch lifecycle: "waiting" (sleeping until the next check),
+ * "awaiting" (check-in posted, waiting on the engineer), then a terminal
+ * "recovered" | "regressed" | "expired" (no answer after the last check).
+ */
+export type WatchState = "waiting" | "awaiting" | Verdict | "expired";
+
+export const MAX_RECOVERY_CHECKS = 3;
+
+export interface RecoveryWatch {
+  workflowId: string | null;
+  state: WatchState | null;
+  /** Check-ins posted so far. */
+  round: number;
+  maxChecks: number;
+  /** When the next check-in is due (or, after the last one, when the watch expires). */
+  nextCheckAt: number | null;
+}
+
+export interface StakeholderUpdate {
+  round: number;
+  content: string;
+  createdAt: number;
+}
+
 export interface IncidentSnapshot {
   meta: IncidentMeta;
   timeline: TimelineEvent[];
   messages: ChatMessage[];
   postmortem: PostmortemJob;
+  watch: RecoveryWatch;
+  updates: StakeholderUpdate[];
 }
 
 /** What the extractor model is allowed to change after each user message. */
