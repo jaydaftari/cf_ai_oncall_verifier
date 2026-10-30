@@ -1,5 +1,7 @@
 # cf_ai_oncall_verifier
 
+[![CI](https://github.com/jaydaftari/cf_ai_oncall_verifier/actions/workflows/ci.yml/badge.svg)](https://github.com/jaydaftari/cf_ai_oncall_verifier/actions/workflows/ci.yml)
+
 **On-Call Verifier** is an AI on-call copilot, built entirely on Cloudflare, that won't let you close an incident until recovery is verified.
 
 Most incident tools treat "the graphs look better" as the end of the incident. In practice, many incidents regress after a hasty rollback, a cache that refills, or a retry storm that returns once traffic picks up. On-Call Verifier pairs with the on-call engineer through triage. Once the incident is mitigated, a long-running **Cloudflare Workflow** keeps checking back:
@@ -34,7 +36,7 @@ Alongside every reply, a second Llama 3.3 call with a strict JSON schema pulls o
 The status can become **Mitigated** in two ways: the model reads "we rolled back, errors are dropping" in the chat, or the engineer picks it from the dropdown. Either way, the Durable Object starts a `RecoveryWatchWorkflow`:
 
 ```
-sleep(interval)                                   default 15 minutes, set by RECOVERY_CHECK_INTERVAL
+sleep(interval)                                   RECOVERY_CHECK_INTERVAL: 2 minutes for the demo, ~15 for real on-call
 repeat up to 3 times:
   draft a stakeholder update (Llama 3.3, retried; falls back to a template)
   post a check-in to the chat: "still at baseline?"
@@ -87,6 +89,20 @@ Design notes:
 - **A Durable Object per incident** gives one place to coordinate every request about that incident. Chat turns, extractor writes, check-ins and verdicts are serialized, with no external database and no races. The Workflows decide *when* things happen; the Durable Object decides *what the incident's state is*.
 - **LLM output is untrusted input.** Extraction results go through `sanitizeExtraction` (enum allow-lists, length caps, a 5-event cap, de-duplication) before they're written.
 
+## Production hardening
+
+The public deployment is open to anyone, so it is built to survive that:
+
+| Concern | What's in place |
+| --- | --- |
+| **Abuse and AI cost** | Per-IP rate limits using the Workers Rate Limiting binding: 12 requests/min on endpoints that call the model (`chat`, `postmortem`) and 60/min on other writes. Over the limit returns `429` with `Retry-After`. Request bodies are capped at 32 KB and chat messages at 8,000 characters |
+| **Model failures** | Chat returns a clean `502` and rolls back the unanswered user turn so the history stays well-formed. Postmortem steps retry with exponential backoff. If the stakeholder update fails, the recovery watch falls back to a template instead of stopping. Deterministic failures use `NonRetryableError` |
+| **Unexpected errors** | A top-level handler logs the error with its route and returns a generic `500`, so internals never leak to the client |
+| **Untrusted content in the browser** | Model output is rendered as Markdown through DOMPurify. A strict Content-Security-Policy (`script-src 'self'`, `frame-ancestors 'none'`) plus `nosniff`, `X-Frame-Options` and `Referrer-Policy` headers are set in [`public/_headers`](public/_headers). Front-end libraries are self-hosted and version-pinned, so no third-party scripts load at runtime |
+| **State integrity** | One Durable Object per incident serializes all writes. Workflow callbacks carry their instance ID so a superseded watch can't write state. Incident IDs are random UUIDs |
+| **Operability** | `GET /api/health`. Workers Observability is enabled (logs and traces in the Cloudflare dashboard). Each Workflow step is named, so a stuck or failed instance shows exactly where it stopped |
+| **CI** | GitHub Actions runs the type-check, unit tests and a `wrangler deploy --dry-run` bundle check on every push and PR |
+
 ## API
 
 | Method & path | Description |
@@ -99,6 +115,7 @@ Design notes:
 | `POST /api/incidents/:id/chat` | `{message}` → SSE events: `delta`, then `state`, then `done` (or `error`) |
 | `POST /api/incidents/:id/postmortem` | Start the postmortem Workflow (`409` if one is running) |
 | `GET /api/incidents/:id/postmortem` | Job stage, Workflow status and Markdown once complete |
+| `GET /api/health` | Liveness check |
 
 ## Running it
 
@@ -119,7 +136,7 @@ npm run dev
 
 Open http://localhost:8787. The Durable Object, both Workflows and the static assets run locally in `workerd`. The Workers AI binding always runs remotely, which is why `wrangler login` is required even for local dev.
 
-To watch the recovery loop without waiting 15 minutes per check-in, shorten the interval:
+To watch the recovery loop faster than the configured 2 minutes per check-in, shorten the interval:
 
 ```bash
 npx wrangler dev --var RECOVERY_CHECK_INTERVAL:"30 seconds"
@@ -166,15 +183,17 @@ src/
   prompts.ts                  Every prompt sent to the model
   lib.ts                      Pure helpers (SSE parser, sanitizer, transcript, durations, assembly)
   types.ts
-public/                       Chat UI (no build step)
+public/                       Chat UI (no build step); _headers sets the CSP and security headers
+public/vendor/                Self-hosted, pinned marked + DOMPurify
 test/lib.test.ts              Unit tests
-wrangler.jsonc                Bindings: AI, Durable Object, two Workflows, assets, check interval
+.github/workflows/ci.yml      CI: type-check, tests, bundle check
+wrangler.jsonc                Bindings: AI, Durable Object, two Workflows, rate limiters, assets, check interval
 PROMPTS.md                    AI prompts used to build this project
 ```
 
 ## Limitations and next steps
 
-- No authentication: anyone with an incident ID can open it. In production, put Cloudflare Access in front, or add per-user auth and scope incidents to a team.
+- No authentication. Incident IDs are unguessable UUIDs, but anyone holding one can open that incident. For a real team, put Cloudflare Access in front, or add per-user auth and scope incidents to a team.
 - The engineer has to confirm recovery manually. The natural next step is for each check-in to query real signals (a Prometheus or Analytics Engine endpoint) and pre-fill the verdict, leaving the human to approve it.
 - Stakeholder updates are drafted but not sent. A Slack or status-page webhook would be one more Workflow step.
 - The sidebar's incident list is kept per browser in `localStorage`. A small index Durable Object or D1 table would let a team share it.

@@ -186,7 +186,7 @@ export class IncidentRoom extends DurableObject<Env> {
     const meta = this.meta();
     const timeline = this.timeline();
     const history = this.messages(CHAT_HISTORY_TURNS);
-    this.insertMessage("user", message);
+    const userMessageId = this.insertMessage("user", message);
 
     // Structured-record extraction runs alongside the chat reply; the updated
     // record is sent as the final event of the stream.
@@ -208,6 +208,8 @@ export class IncidentRoom extends DurableObject<Env> {
       })) as ReadableStream<Uint8Array>;
     } catch (err) {
       console.error("chat model call failed", err);
+      // Don't leave an unanswered turn in the history the next prompt is built from.
+      this.sql.exec("DELETE FROM messages WHERE id = ?", userMessageId);
       return Response.json({ error: "The model is unavailable, please retry." }, { status: 502 });
     }
 
@@ -413,12 +415,14 @@ export class IncidentRoom extends DurableObject<Env> {
       .map((r) => ({ role: r.role, content: r.content, createdAt: r.created_at }));
   }
 
-  private insertMessage(role: ChatMessage["role"], content: string) {
-    this.sql.exec(
-      "INSERT INTO messages (role, content, created_at) VALUES (?, ?, ?)",
-      role,
-      content,
-      Date.now(),
-    );
+  private insertMessage(role: ChatMessage["role"], content: string): number {
+    return this.sql
+      .exec<{ id: number }>(
+        "INSERT INTO messages (role, content, created_at) VALUES (?, ?, ?) RETURNING id",
+        role,
+        content,
+        Date.now(),
+      )
+      .one().id;
   }
 }

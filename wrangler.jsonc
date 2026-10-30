@@ -33,8 +33,17 @@
     }
   ],
 
-  // Time between recovery check-ins (any Workflows duration, e.g. "10 minutes").
-  "vars": { "RECOVERY_CHECK_INTERVAL": "15 minutes" },
+  // Time between recovery check-ins (any Workflows duration). A real on-call
+  // rotation would use ~15 minutes; the public demo uses 2 so reviewers can
+  // see a check-in without waiting.
+  "vars": { "RECOVERY_CHECK_INTERVAL": "2 minutes" },
+
+  // Per-IP abuse limits for the public deployment. AI_LIMITER guards the
+  // endpoints that spend Workers AI quota; API_LIMITER guards all other writes.
+  "ratelimits": [
+    { "name": "AI_LIMITER", "namespace_id": "1001", "simple": { "limit": 12, "period": 60 } },
+    { "name": "API_LIMITER", "namespace_id": "1002", "simple": { "limit": 60, "period": 60 } }
+  ],
 
   "observability": { "enabled": true }
 }

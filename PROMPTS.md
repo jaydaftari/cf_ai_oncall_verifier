@@ -63,6 +63,44 @@ The project was built in one Claude Code session. These are my prompts, verbatim
   - Re-mitigation, where only the new watch posts.
   - Clearing the incident mid-watch.
 
+**Prompts 7–15** (running it for the first time, and questions along the way)
+
+> can you run this projectso I can check what you have built
+
+> is there anything else neded form my side?
+
+> done check now
+
+> what have you build though?
+
+> It says failed to opne code
+
+> opne page i mean
+
+> is it free registering  jaydaftari.workers.dev, this?
+
+> so is there any database you are usign?
+
+> okay make it production ready, so I can submit my application
+
+### What the assistant did with prompts 7–15
+
+- Walked me through `wrangler login` and registered the account's free `workers.dev` subdomain (with my approval), which Workers AI needs even in local dev.
+- Ran the app against the real Llama 3.3 and confirmed the full flow end to end:
+  - Streaming triage advice.
+  - The record auto-filled with title, SEV2, service and timeline.
+  - Mitigation detected from the chat, which started the watch.
+  - A real check-in with an LLM-written stakeholder update.
+- Fixed a wording bug found in that run ("1 minutes").
+- Explained the storage design: per-incident SQLite inside Durable Objects, with no external database.
+- Production hardening for a public deployment:
+  - Per-IP rate limiting with the Workers Rate Limiting binding, plus body-size caps.
+  - A top-level error handler.
+  - Rollback of the unanswered user turn when the model call fails.
+  - A strict CSP and security headers, with self-hosted, pinned front-end libraries.
+  - A health endpoint.
+  - GitHub Actions CI: type-check, tests and a bundle check.
+
 ## 2. Runtime prompts (sent to Llama 3.3 by the app)
 
 All prompts are in [`src/prompts.ts`](src/prompts.ts). In summary:
