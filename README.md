@@ -14,6 +14,8 @@ Most incident tools treat "the graphs look better" as the end of the incident. I
 
 When the incident is over, a second Workflow drafts a blameless postmortem that records how recovery was verified.
 
+**Live demo: https://cf-ai-oncall-verifier.jaydaftari.workers.dev**. Click a starter prompt, report a fix ("rolled back, p99 is back to normal"), and the first recovery check-in arrives 2 minutes later.
+
 Built for the Cloudflare AI application assignment.
 
 | Requirement | Implementation |
@@ -95,7 +97,7 @@ The public deployment is open to anyone, so it is built to survive that:
 
 | Concern | What's in place |
 | --- | --- |
-| **Abuse and AI cost** | Per-IP rate limits using the Workers Rate Limiting binding: 12 requests/min on endpoints that call the model (`chat`, `postmortem`) and 60/min on other writes. Over the limit returns `429` with `Retry-After`. Request bodies are capped at 32 KB and chat messages at 8,000 characters |
+| **Abuse and AI cost** | Two layers. **Per incident (exact, in the Durable Object):** one model reply at a time (`409` otherwise) and at most 300 messages per incident. **Per IP (best-effort, Workers Rate Limiting binding):** 12 requests/min on endpoints that call the model and 60/min on other writes, returning `429` with `Retry-After`. Cloudflare's limiter counts per location and is eventually consistent, so it slows bursts rather than enforcing an exact cap; the exact guards live in the Durable Object. Request bodies are capped at 32 KB and chat messages at 8,000 characters |
 | **Model failures** | Chat returns a clean `502` and rolls back the unanswered user turn so the history stays well-formed. Postmortem steps retry with exponential backoff. If the stakeholder update fails, the recovery watch falls back to a template instead of stopping. Deterministic failures use `NonRetryableError` |
 | **Unexpected errors** | A top-level handler logs the error with its route and returns a generic `500`, so internals never leak to the client |
 | **Untrusted content in the browser** | Model output is rendered as Markdown through DOMPurify. A strict Content-Security-Policy (`script-src 'self'`, `frame-ancestors 'none'`) plus `nosniff`, `X-Frame-Options` and `Referrer-Policy` headers are set in [`public/_headers`](public/_headers). Front-end libraries are self-hosted and version-pinned, so no third-party scripts load at runtime |

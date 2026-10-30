@@ -24,6 +24,9 @@ import type {
 
 const CHAT_HISTORY_TURNS = 20;
 const MAX_MESSAGE_CHARS = 8_000;
+// Exact per-incident guards; the per-IP limiter in the Worker is best-effort.
+const MAX_MESSAGES_PER_INCIDENT = 300;
+const REPLY_LOCK_MS = 60_000;
 export const VERDICT_EVENT = "recovery-verdict";
 
 const utcNow = () => `${new Date().toISOString().slice(11, 16)} UTC`;
@@ -41,6 +44,7 @@ const utcNow = () => `${new Date().toISOString().slice(11, 16)} UTC`;
  */
 export class IncidentRoom extends DurableObject<Env> {
   private sql: SqlStorage;
+  private replyStartedAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -182,6 +186,19 @@ export class IncidentRoom extends DurableObject<Env> {
     if (message.length > MAX_MESSAGE_CHARS) {
       return Response.json({ error: `message exceeds ${MAX_MESSAGE_CHARS} characters` }, { status: 413 });
     }
+    // One model reply at a time per incident. The lock expires on its own in
+    // case a client disconnects mid-stream and flush never runs.
+    if (Date.now() - this.replyStartedAt < REPLY_LOCK_MS) {
+      return Response.json({ error: "Wait for the current reply to finish." }, { status: 409 });
+    }
+    const { n } = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one();
+    if (n >= MAX_MESSAGES_PER_INCIDENT) {
+      return Response.json(
+        { error: "This incident has reached its message limit. Start a new incident." },
+        { status: 429 },
+      );
+    }
+    this.replyStartedAt = Date.now();
 
     const meta = this.meta();
     const timeline = this.timeline();
@@ -210,6 +227,7 @@ export class IncidentRoom extends DurableObject<Env> {
       console.error("chat model call failed", err);
       // Don't leave an unanswered turn in the history the next prompt is built from.
       this.sql.exec("DELETE FROM messages WHERE id = ?", userMessageId);
+      this.replyStartedAt = 0;
       return Response.json({ error: "The model is unavailable, please retry." }, { status: 502 });
     }
 
@@ -237,6 +255,7 @@ export class IncidentRoom extends DurableObject<Env> {
         if (reply.trim()) this.insertMessage("assistant", reply);
         else send(controller, { type: "error", error: "The model returned an empty reply." });
         await extraction;
+        this.replyStartedAt = 0;
         send(controller, { type: "state", state: this.snapshot() });
         send(controller, { type: "done" });
       },

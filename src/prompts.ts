@@ -102,7 +102,13 @@ export const POSTMORTEM_SYSTEM_PROMPT = `You write blameless incident postmortem
 export function timelinePrompt(incident: string, transcript: string): string {
   return `Reconstruct a precise chronological timeline of this incident.
 
-Format: a Markdown bullet list, one line per event: "- **<time>**: <what happened>". Keep times as written (use "??" if unknown). Include detection, escalation, key diagnostic findings, mitigation and resolution. Maximum 20 bullets.
+Format: a Markdown bullet list, one line per event: "- **<time>**: <what happened>". Keep times exactly as written.
+
+Rules:
+- Include only things that happened to the system or that the responders did: the trigger, detection, key findings, mitigation, recovery verification, resolution.
+- Leave out conversation mechanics (questions asked, hypotheses discussed, updates or postmortems being drafted) and anything that did not happen yet.
+- Prefer events with a stated time. Include an untimed event only if it is essential, and mark its time as "??".
+- Maximum 12 bullets.
 
 Incident record:
 ${incident}
