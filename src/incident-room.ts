@@ -135,7 +135,7 @@ export class IncidentRoom extends DurableObject<Env> {
     );
     this.insertMessage(
       "assistant",
-      `**Recovery check #${round}**: ${minutes} minutes since mitigation.\n\n` +
+      `**Recovery check #${round}**: ${minutes} minute${minutes === 1 ? "" : "s"} since mitigation.\n\n` +
         "Are error rates, latency and saturation still at baseline? Answer with the buttons in the panel, " +
         "or just tell me what the dashboards show.\n\nI drafted a stakeholder update in the panel.",
     );
